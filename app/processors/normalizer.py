@@ -63,25 +63,33 @@ def normalise_lead(lead: Lead) -> Lead:
         norm_phone = None
 
     # Email
-    norm_email, email_status = validate_email_address(lead.email)
+    # If the email field is None but the upstream status is INVALID (e.g. set by
+    # the CSV importer after rejecting a bad address), preserve INVALID rather
+    # than overwriting with MISSING.
+    if lead.email is None and lead.email_status == "INVALID":
+        norm_email, email_status = None, "INVALID"
+    else:
+        norm_email, email_status = validate_email_address(lead.email)
 
     return Lead(
-        company_name   = _clean_text(lead.company_name) or lead.company_name,
-        contact_person = _clean_text(lead.contact_person),
-        designation    = _clean_text(lead.designation),
-        phone_number   = norm_phone,
-        email          = norm_email,
-        address        = _clean_address(lead.address),
-        city           = _title(lead.city),
-        state          = _title(lead.state),
-        gst_no         = (_clean_text(lead.gst_no) or "").upper() or None,
-        product_name   = _clean_text(lead.product_name),
-        product_url    = lead.product_url,
-        source         = lead.source,
-        phone_status   = phone_status,
-        email_status   = email_status,
-        scraped_at     = lead.scraped_at,
-        raw_url        = lead.raw_url,
+        company_name       = _clean_text(lead.company_name) or lead.company_name,
+        contact_person     = _clean_text(lead.contact_person),
+        designation        = _clean_text(lead.designation),
+        phone_number       = norm_phone,
+        email              = norm_email,
+        address            = _clean_address(lead.address),
+        city               = _title(lead.city),
+        state              = _title(lead.state),
+        gst_no             = (_clean_text(lead.gst_no) or "").upper() or None,
+        product_name       = _clean_text(lead.product_name),
+        product_url        = lead.product_url,
+        source             = lead.source,
+        phone_status       = phone_status,
+        email_status       = email_status,
+        phone_source       = lead.phone_source,   # preserve MANUAL/SCRAPED
+        email_source       = lead.email_source,   # preserve MANUAL/SCRAPED
+        scraped_at         = lead.scraped_at,
+        raw_url            = lead.raw_url,
         extra_product_urls = lead.extra_product_urls,
     )
 

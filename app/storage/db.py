@@ -30,9 +30,15 @@ CREATE TABLE IF NOT EXISTS url_status (
     source      TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'PENDING',   -- PENDING|DONE|FAILED|BLOCKED
     error       TEXT,
+    metadata    TEXT,           -- JSON blob: listing-time data (product_name, product_url …)
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
+"""
+
+# Migration: add metadata column to existing DBs that predate this change
+_MIGRATE_URL_STATUS = """
+ALTER TABLE url_status ADD COLUMN metadata TEXT;
 """
 
 _DDL_LEADS = """
@@ -53,11 +59,17 @@ CREATE TABLE IF NOT EXISTS leads (
     source          TEXT NOT NULL,
     phone_status    TEXT NOT NULL DEFAULT 'MISSING',
     email_status    TEXT NOT NULL DEFAULT 'MISSING',
+    phone_source    TEXT NOT NULL DEFAULT 'SCRAPED',  -- SCRAPED | MANUAL
+    email_source    TEXT NOT NULL DEFAULT 'SCRAPED',  -- SCRAPED | MANUAL
     scraped_at      TEXT NOT NULL,
     raw_url         TEXT,
     created_at      TEXT NOT NULL
 );
 """
+
+# Migration: add phone_source / email_source to existing DBs
+_MIGRATE_LEADS_PHONE_SOURCE = "ALTER TABLE leads ADD COLUMN phone_source TEXT NOT NULL DEFAULT 'SCRAPED';"
+_MIGRATE_LEADS_EMAIL_SOURCE = "ALTER TABLE leads ADD COLUMN email_source TEXT NOT NULL DEFAULT 'SCRAPED';"
 
 
 # ── Connection helper ─────────────────────────────────────────────────────────
@@ -85,6 +97,15 @@ def init_db() -> None:
     with _conn() as con:
         con.execute(_DDL_URL_STATUS)
         con.execute(_DDL_LEADS)
+        # Non-destructive migrations
+        url_cols  = {row[1] for row in con.execute("PRAGMA table_info(url_status)")}
+        lead_cols = {row[1] for row in con.execute("PRAGMA table_info(leads)")}
+        if "metadata" not in url_cols:
+            con.execute(_MIGRATE_URL_STATUS)
+        if "phone_source" not in lead_cols:
+            con.execute(_MIGRATE_LEADS_PHONE_SOURCE)
+        if "email_source" not in lead_cols:
+            con.execute(_MIGRATE_LEADS_EMAIL_SOURCE)
     log.info("DB initialised", extra={"stage": "db", "status": "OK",
                                        "path": str(settings.db_path_abs)})
 
@@ -92,23 +113,38 @@ def init_db() -> None:
 # ── url_status table ──────────────────────────────────────────────────────────
 
 def upsert_url(url: str, source: str, status: str = "PENDING",
-               error: Optional[str] = None) -> None:
+               error: Optional[str] = None,
+               metadata: Optional[dict] = None) -> None:
     now = datetime.utcnow().isoformat()
+    meta_json = json.dumps(metadata) if metadata else None
     with _conn() as con:
         con.execute("""
-            INSERT INTO url_status (url, source, status, error, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO url_status (url, source, status, error, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(url) DO UPDATE SET
                 status     = excluded.status,
                 error      = excluded.error,
+                metadata   = COALESCE(excluded.metadata, url_status.metadata),
                 updated_at = excluded.updated_at
-        """, (url, source, status, error, now, now))
+        """, (url, source, status, error, meta_json, now, now))
 
 
 def get_url_status(url: str) -> Optional[str]:
     with _conn() as con:
         row = con.execute("SELECT status FROM url_status WHERE url = ?", (url,)).fetchone()
     return row["status"] if row else None
+
+
+def get_url_metadata(url: str) -> Optional[dict]:
+    """Return the JSON metadata stored alongside a URL, or None."""
+    with _conn() as con:
+        row = con.execute("SELECT metadata FROM url_status WHERE url = ?", (url,)).fetchone()
+    if row and row["metadata"]:
+        try:
+            return json.loads(row["metadata"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return None
 
 
 def get_pending_urls(source: str) -> List[str]:
@@ -140,9 +176,9 @@ def insert_lead(lead: Lead) -> int:
                 company_name, contact_person, designation,
                 phone_number, email, address, city, state, gst_no,
                 product_name, product_url, extra_product_urls,
-                source, phone_status, email_status,
+                source, phone_status, email_status, phone_source, email_source,
                 scraped_at, raw_url, created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             lead.company_name, lead.contact_person, lead.designation,
             lead.phone_number, lead.email,
@@ -150,26 +186,23 @@ def insert_lead(lead: Lead) -> int:
             lead.product_name, lead.product_url,
             json.dumps(lead.extra_product_urls),
             lead.source, lead.phone_status, lead.email_status,
+            lead.phone_source, lead.email_source,
             lead.scraped_at.isoformat() if lead.scraped_at else now,
             lead.raw_url, now,
         ))
     return cur.lastrowid
 
 
-def get_all_leads() -> List[Lead]:
-    """Return all leads as Lead objects (for export)."""
-    with _conn() as con:
-        rows = con.execute("SELECT * FROM leads ORDER BY id").fetchall()
+def _rows_to_leads(rows) -> List[Lead]:
+    """Convert DB rows to Lead objects, tolerating extra/missing columns."""
     leads = []
     for r in rows:
         d = dict(r)
         d["extra_product_urls"] = json.loads(d.get("extra_product_urls") or "[]")
-        # scraped_at stored as ISO string
         try:
             d["scraped_at"] = datetime.fromisoformat(d["scraped_at"])
         except (TypeError, ValueError):
             d["scraped_at"] = datetime.utcnow()
-        # Remove DB-only columns
         for col in ("id", "created_at"):
             d.pop(col, None)
         try:
@@ -179,6 +212,23 @@ def get_all_leads() -> List[Lead]:
                 "stage": "db_read", "status": "WARN", "error": str(exc)
             })
     return leads
+
+
+def get_all_leads() -> List[Lead]:
+    """Return all leads ordered by id."""
+    with _conn() as con:
+        rows = con.execute("SELECT * FROM leads ORDER BY id").fetchall()
+    return _rows_to_leads(rows)
+
+
+def get_leads_by_source(source: str) -> List[Lead]:
+    """Return leads filtered by source label (case-insensitive prefix match)."""
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT * FROM leads WHERE source LIKE ? ORDER BY id",
+            (f"%{source}%",)
+        ).fetchall()
+    return _rows_to_leads(rows)
 
 
 def count_leads() -> int:

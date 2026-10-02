@@ -43,9 +43,15 @@ _YAML_PATH = pathlib.Path(__file__).parent.parent / "config" / "sources.yaml"
 with _YAML_PATH.open() as _f:
     _CFG = yaml.safe_load(_f)["tradeindia"]
 
-BASE_URL         = _CFG["base_url"]
-LISTING_TEMPLATE = _CFG["listing_url_template"]
-PAGE2_TEMPLATE   = _CFG["listing_page2_template"]
+BASE_URL          = _CFG["base_url"]
+LISTING_TEMPLATE  = _CFG["listing_url_template"]    # legacy / backward-compat
+PAGE2_TEMPLATE    = _CFG["listing_page2_template"]  # legacy / backward-compat
+LISTING_CATEGORIES = _CFG.get("listing_categories", [
+    # fallback if yaml ever missing the new key
+    {"name": "manufacturers",
+     "page1_template": LISTING_TEMPLATE,
+     "page2_template": PAGE2_TEMPLATE},
+])
 LISTING_MAP      = _CFG["listing_field_map"]
 PROFILE_MAP      = _CFG["profile_field_map"]
 PDP_MAP          = _CFG["pdp_company_field_map"]
@@ -202,10 +208,13 @@ def _detect_page_type(nd: Dict[str, Any], url: str) -> str:
 
 # ── Parse functions per page type ─────────────────────────────────────────────
 
-def _parse_listing_page(nd: Dict[str, Any], url: str) -> List[str]:
+def _parse_listing_page(nd: Dict[str, Any], url: str) -> List[Dict[str, Any]]:
     """
-    Extract seller profile URLs from a manufacturer listing page.
-    Returns list of absolute profile URLs.
+    Extract seller entries from a manufacturer listing page.
+    Returns list of dicts, each with:
+      profile_url  – absolute URL to the seller profile page (the PENDING URL)
+      product_name – product name from the listing (carried as metadata)
+      product_url  – absolute product detail URL (carried as metadata)
     """
     state = _dig(nd, "props", "pageProps", "initialState")
     sellers = _dig(state, "manufacturer", "manufacturer_page",
@@ -213,16 +222,22 @@ def _parse_listing_page(nd: Dict[str, Any], url: str) -> List[str]:
     if not sellers:
         return []
 
-    profile_urls = []
+    entries = []
     for s in sellers:
         profile_path = s.get(LISTING_MAP.get("profile_url", "profile_url"))
-        if profile_path:
-            profile_urls.append(_abs(profile_path))
+        if not profile_path:
+            continue
+        prod_path = s.get(LISTING_MAP.get("product_url", "prod_url"), "")
+        entries.append({
+            "profile_url":  _abs(profile_path),
+            "product_name": s.get(LISTING_MAP.get("product_name", "product_name")),
+            "product_url":  _abs(prod_path) if prod_path else None,
+        })
 
-    log.info(f"Listing page: found {len(profile_urls)} sellers",
+    log.info(f"Listing page: found {len(entries)} sellers",
              extra={"source": "TradeIndia", "url": url,
                     "stage": "listing_parse", "status": "OK"})
-    return profile_urls
+    return entries
 
 
 def _parse_profile_page(nd: Dict[str, Any], soup: BeautifulSoup,
@@ -322,23 +337,33 @@ class TradeIndiaScraper(BaseScraper):
     def source_name(self) -> str:
         return "TradeIndia"
 
-    def listing_url(self, keyword: str, page: int) -> str:
+    def listing_url(self, keyword: str, page: int, category: str = "manufacturers") -> str:
+        """Return the listing page URL for a given keyword, page, and category."""
         slug = _keyword_slug(keyword)
+        # Find the category config
+        cat_cfg = next(
+            (c for c in LISTING_CATEGORIES if c["name"] == category),
+            LISTING_CATEGORIES[0],
+        )
         if page == 1:
-            return LISTING_TEMPLATE.format(keyword_slug=slug)
-        return PAGE2_TEMPLATE.format(keyword_slug=slug, page=page)
+            return cat_cfg["page1_template"].format(keyword_slug=slug)
+        return cat_cfg["page2_template"].format(keyword_slug=slug, page=page)
 
-    def search_listings(self, keyword: str, page: int = 1) -> List[str]:
+    def _fetch_listing_entries(
+        self, keyword: str, page: int, category: str = "manufacturers"
+    ) -> List[Dict[str, Any]]:
         """
-        Fetch the manufacturer listing page and return profile URLs.
-        Returns [] on any error (block, parse failure, robots disallow).
+        Fetch one listing page for a given category and return entry dicts
+        (profile_url, product_name, product_url).
+        Returns [] on any error.
         """
         from app.core.http_client import fetch_html
         from app.core.exceptions import BlockedError, RobotsDisallowedError
 
-        url = self.listing_url(keyword, page)
-        log.info(f"Fetching listing page {page}", extra={
-            "source": "TradeIndia", "url": url, "stage": "search", "status": "START"
+        url = self.listing_url(keyword, page, category)
+        log.info(f"Fetching listing page {page} [{category}]", extra={
+            "source": "TradeIndia", "url": url, "stage": "search",
+            "status": "START", "category": category, "page": page,
         })
 
         try:
@@ -369,12 +394,36 @@ class TradeIndiaScraper(BaseScraper):
                                "stage": "search", "status": "WARN"})
             return []
 
-        profile_urls = _parse_listing_page(nd, url)
-        if not profile_urls:
-            log.warning("SELECTOR_BROKEN TradeIndia — listing returned 0 sellers",
-                        extra={"source": "TradeIndia", "url": url,
-                               "stage": "search", "status": "SELECTOR_BROKEN"})
-        return profile_urls
+        entries = _parse_listing_page(nd, url)
+        if not entries:
+            log.warning(
+                f"SELECTOR_BROKEN TradeIndia — listing returned 0 sellers "
+                f"[category={category}, page={page}]",
+                extra={"source": "TradeIndia", "url": url,
+                       "stage": "search", "status": "SELECTOR_BROKEN",
+                       "category": category, "page": page},
+            )
+        return entries
+
+    def search_listings(self, keyword: str, page: int = 1) -> List[str]:
+        """BaseScraper contract: return profile URLs only (manufacturers category only)."""
+        entries = self._fetch_listing_entries(keyword, page, category="manufacturers")
+        return [e["profile_url"] for e in entries]
+
+    def search_listings_meta(self, keyword: str, page: int = 1) -> List[Dict[str, Any]]:
+        """
+        Extended version used by the pipeline: iterates ALL configured categories
+        for the given page number, deduplicates by profile_url, returns full dicts.
+        """
+        seen: set = set()
+        all_entries: List[Dict[str, Any]] = []
+        for cat in LISTING_CATEGORIES:
+            entries = self._fetch_listing_entries(keyword, page, cat["name"])
+            for e in entries:
+                if e["profile_url"] not in seen:
+                    seen.add(e["profile_url"])
+                    all_entries.append(e)
+        return all_entries
 
     def parse_listing(self, html: str, url: str) -> Optional[Lead]:
         """

@@ -73,23 +73,54 @@ def test_detect_page_type_product(html_product_detail):
 # ── listing page parsing ──────────────────────────────────────────────────────
 
 class TestListingPage:
-    def test_returns_profile_urls(self, html_listing):
+    def test_returns_entry_dicts(self, html_listing):
+        """_parse_listing_page returns dicts with profile_url, product_name, product_url."""
         nd = _get_next_data(soup(html_listing))
-        urls = _parse_listing_page(nd, "https://www.tradeindia.com/manufacturers/rose-water.html")
+        entries = _parse_listing_page(nd, "https://www.tradeindia.com/manufacturers/rose-water.html")
+        assert len(entries) == 28
+        for e in entries:
+            assert "profile_url" in e
+            assert "product_name" in e
+            assert "product_url" in e
+
+    def test_returns_profile_urls(self, html_listing):
+        """search_listings (BaseScraper contract) still returns List[str]."""
+        # Use _parse_listing_page via scraper.search_listings to verify contract
+        nd = _get_next_data(soup(html_listing))
+        entries = _parse_listing_page(nd, "https://www.tradeindia.com/manufacturers/rose-water.html")
+        urls = [e["profile_url"] for e in entries]
         assert len(urls) == 28
 
     def test_urls_are_absolute(self, html_listing):
         nd = _get_next_data(soup(html_listing))
-        urls = _parse_listing_page(nd, "https://www.tradeindia.com/manufacturers/rose-water.html")
-        for url in urls:
-            assert url.startswith("https://www.tradeindia.com/"), \
-                f"Expected absolute URL, got: {url}"
+        entries = _parse_listing_page(nd, "https://www.tradeindia.com/manufacturers/rose-water.html")
+        for e in entries:
+            assert e["profile_url"].startswith("https://www.tradeindia.com/"), \
+                f"Expected absolute URL, got: {e['profile_url']}"
 
     def test_known_company_in_results(self, html_listing):
         nd = _get_next_data(soup(html_listing))
-        urls = _parse_listing_page(nd, "https://www.tradeindia.com/manufacturers/rose-water.html")
-        # Earth Science Ayurveda was seller #1 in our spike
-        assert any("earth-science-ayurveda" in u.lower() for u in urls)
+        entries = _parse_listing_page(nd, "https://www.tradeindia.com/manufacturers/rose-water.html")
+        profile_urls = [e["profile_url"] for e in entries]
+        assert any("earth-science-ayurveda" in u.lower() for u in profile_urls)
+
+    def test_product_name_populated(self, html_listing):
+        """product_name must be present in listing entries (this was the Task 1 bug)."""
+        nd = _get_next_data(soup(html_listing))
+        entries = _parse_listing_page(nd, "https://www.tradeindia.com/manufacturers/rose-water.html")
+        names = [e["product_name"] for e in entries if e.get("product_name")]
+        assert len(names) > 0, "Expected product_name in at least some listing entries"
+        # First entry from spike: "Nuerma Science Rose Water (Gulab Jal)..."
+        assert any("Rose Water" in (n or "") for n in names)
+
+    def test_product_url_populated(self, html_listing):
+        """product_url must be absolute in listing entries."""
+        nd = _get_next_data(soup(html_listing))
+        entries = _parse_listing_page(nd, "https://www.tradeindia.com/manufacturers/rose-water.html")
+        urls = [e["product_url"] for e in entries if e.get("product_url")]
+        assert len(urls) > 0
+        for u in urls:
+            assert u.startswith("https://"), f"Expected absolute URL: {u}"
 
 
 # ── profile page parsing ──────────────────────────────────────────────────────

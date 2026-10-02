@@ -147,3 +147,108 @@ class TestExcelOutput:
         wb = openpyxl.load_workbook(out)
         ws = wb["Leads"]
         assert ws.max_row == 1   # header only
+
+
+class TestExcelHardening:
+    """Task 3: PermissionError fallback, Last Updated in summary, OneDrive path."""
+
+    def test_last_updated_in_summary(self, tmp_path):
+        """Run Summary must have a 'Last Updated' row."""
+        out = tmp_path / "test.xlsx"
+        export_excel(_sample_leads(), output_path=out)
+        wb = openpyxl.load_workbook(out)
+        ws2 = wb["Run Summary"]
+        all_labels = [str(ws2.cell(r, 1).value or "") for r in range(1, ws2.max_row + 1)]
+        assert any("Last Updated" in lbl for lbl in all_labels), \
+            f"'Last Updated' not found in summary labels: {all_labels}"
+
+    def test_total_leads_in_summary(self, tmp_path):
+        """Run Summary must show Total Leads count."""
+        out = tmp_path / "test.xlsx"
+        export_excel(_sample_leads(), output_path=out)
+        wb = openpyxl.load_workbook(out)
+        ws2 = wb["Run Summary"]
+        all_labels = [str(ws2.cell(r, 1).value or "") for r in range(1, ws2.max_row + 1)]
+        assert any("Total Leads" in lbl for lbl in all_labels), \
+            f"'Total Leads' not found in summary labels: {all_labels}"
+
+    def test_permission_error_writes_fallback(self, tmp_path):
+        """If the target file is locked, a timestamped fallback is written."""
+        from app.exporters.excel_exporter import _save_workbook
+        import openpyxl as ox
+
+        intended = tmp_path / "locked.xlsx"
+        wb = ox.Workbook()
+
+        # Simulate PermissionError by patching save on a temp copy
+        original_save = ox.Workbook.save
+        call_count = [0]
+
+        def mock_save(self, filename):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise PermissionError("File is locked")
+            original_save(self, filename)
+
+        import unittest.mock as mock
+        with mock.patch.object(ox.Workbook, "save", mock_save):
+            actual = _save_workbook(wb, intended)
+
+        # Fallback file must exist and be different from intended
+        assert actual != intended
+        assert actual.exists()
+        assert actual.name.startswith("locked_")
+        assert actual.suffix == ".xlsx"
+
+    def test_permission_error_fallback_is_valid_xlsx(self, tmp_path):
+        """The fallback file must be a readable .xlsx."""
+        from app.exporters.excel_exporter import _save_workbook
+        import openpyxl as ox
+        import unittest.mock as mock
+
+        intended = tmp_path / "locked.xlsx"
+        wb = ox.Workbook()
+        wb.active.title = "Test"
+        wb.active["A1"] = "hello"
+
+        original_save = ox.Workbook.save
+        call_count = [0]
+
+        def mock_save(self, filename):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise PermissionError("locked")
+            original_save(self, filename)
+
+        with mock.patch.object(ox.Workbook, "save", mock_save):
+            actual = _save_workbook(wb, intended)
+
+        wb2 = ox.load_workbook(actual)
+        assert wb2["Test"]["A1"].value == "hello"
+
+    def test_no_crash_when_primary_save_succeeds(self, tmp_path):
+        """Normal save path still works end-to-end."""
+        out = tmp_path / "normal.xlsx"
+        result = export_excel(_sample_leads(), output_path=out)
+        assert result == out
+        assert out.exists()
+
+    def test_onedrive_copy_called_when_configured(self, tmp_path):
+        """If OUTPUT_FILE_ONEDRIVE is set, the file is copied there after save."""
+        import shutil
+        import unittest.mock as mock
+        from app.exporters import excel_exporter as ee
+
+        onedrive_dir = tmp_path / "onedrive"
+        onedrive_dir.mkdir()
+        onedrive_dest = onedrive_dir / "leads.xlsx"
+
+        # Patch settings.onedrive_path to return our tmp dir path
+        with mock.patch.object(
+            type(ee.settings), "onedrive_path",
+            new_callable=lambda: property(lambda self: onedrive_dest)
+        ):
+            out = tmp_path / "primary.xlsx"
+            export_excel(_sample_leads(), output_path=out)
+
+        assert onedrive_dest.exists(), "OneDrive copy was not created"

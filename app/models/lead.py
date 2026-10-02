@@ -45,6 +45,10 @@ class Lead(BaseModel):
     phone_status:   str = "MISSING"        # VALID | INVALID | HIDDEN | MISSING
     email_status:   str = "MISSING"        # VALID | INVALID | MISSING
 
+    # ── Data provenance ───────────────────────────────────────────────────────
+    phone_source:   str = "SCRAPED"        # SCRAPED | MANUAL
+    email_source:   str = "SCRAPED"        # SCRAPED | MANUAL
+
     # ── Housekeeping ──────────────────────────────────────────────────────────
     scraped_at:     datetime = None        # set by scraper on creation
     raw_url:        Optional[str] = None   # the page URL this lead was parsed from

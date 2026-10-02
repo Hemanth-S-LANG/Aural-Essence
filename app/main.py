@@ -1,48 +1,139 @@
 """
 Pipeline orchestrator.
 
-Flow:
+Usage:
+    python -m app.main                              # scrape all sources
+    python -m app.main --source tradeindia          # scrape TradeIndia only
+    python -m app.main --source meesho              # Meesho no-op (blocked sheet only)
+    python -m app.main --source all                 # scrape all + combined Excel
+    python -m app.main --import-csv data.csv --source meesho  # manual CSV import
+
+Flow (scrape mode):
   1. Init DB.
-  2. For each source scraper:
-       a. Resume check: if URLs already exist in DB skip re-discovery (Phase 7).
-       b. Inactive scrapers (Meesho no-op) skip Phase A entirely.
-       c. Phase A — discover profile URLs via search_listings(), register as PENDING.
-       d. Phase B — fetch + parse each PENDING URL, normalise, store.
+  2. For each selected scraper:
+       a. Resume check: skip re-discovery if URLs already in DB.
+       b. Phase A: discover profile URLs, cache product metadata.
+       c. Phase B: fetch → parse → normalise → store.
   3. Deduplicate all leads in DB.
-  4. Export to Excel.
+  4. Export per-source Excel files (+ combined when --source all).
   5. Print end-of-run summary.
 """
+import argparse
+import sys
 from datetime import datetime
-from typing import List
+from pathlib import Path
+from typing import List, Optional
 
 from app.config.settings import settings
-from app.core.http_client import fetch_html
 from app.core.exceptions import BlockedError, RobotsDisallowedError
+from app.core.http_client import fetch_html
 from app.core.logger import get_logger
-from app.exporters.excel_exporter import export_excel
+from app.exporters.excel_exporter import export_excel, export_meesho_blocked
 from app.models.lead import Lead
 from app.processors.deduplicator import deduplicate
 from app.processors.normalizer import normalise_lead
 from app.scrapers.meesho_scraper import MeeshoScraper
 from app.scrapers.tradeindia_scraper import TradeIndiaScraper
 from app.storage.db import (
-    count_by_status, get_all_leads, get_pending_urls,
-    init_db, insert_lead, upsert_url, get_url_status,
+    count_by_status, get_all_leads, get_leads_by_source, get_pending_urls,
+    init_db, insert_lead, upsert_url, get_url_status, get_url_metadata,
 )
 
 log = get_logger(__name__)
 
-_MAX_CONSEC_BLOCKS = 5   # stop source after this many consecutive blocks/empties
+_MAX_CONSEC_BLOCKS = 5
 
 
-def run() -> None:
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="python -m app.main",
+        description="Rose Water seller scraper",
+    )
+    parser.add_argument(
+        "--source",
+        choices=["tradeindia", "meesho", "all"],
+        default="all",
+        help="Which source(s) to run (default: all)",
+    )
+    parser.add_argument(
+        "--import-csv",
+        metavar="FILE",
+        dest="import_csv",
+        help="Path to a CSV file of manually collected leads to import",
+    )
+    return parser.parse_args(argv)
+
+
+# ── Scraper selection ─────────────────────────────────────────────────────────
+
+def _select_scrapers(source: str):
+    """Return the list of scraper instances for the given --source value."""
+    all_scrapers = [TradeIndiaScraper(), MeeshoScraper()]
+    if source == "all":
+        return all_scrapers
+    return [s for s in all_scrapers if s.source_name.lower() == source.lower()]
+
+
+# ── CSV import mode ───────────────────────────────────────────────────────────
+
+def _run_import(csv_path: Path, source: str) -> None:
+    from app.importers.csv_importer import import_csv
+
+    log.info(f"=== CSV import: {csv_path} → source={source} ===",
+             extra={"stage": "main", "status": "START"})
+    init_db()
+
+    leads, imported, skipped = import_csv(csv_path, source)
+    if not leads:
+        print(f"No valid rows imported from {csv_path}. Skipped: {skipped}")
+        return
+
+    # Merge with existing DB leads and deduplicate
+    existing = get_all_leads()
+    all_leads = existing + leads
+    deduped, merged = deduplicate(all_leads)
+
+    # Re-insert all (clear + reload is simplest for a small dataset)
+    # For safety we just insert the new ones; dedup handles overlap on export
+    for lead in leads:
+        try:
+            insert_lead(lead)
+        except Exception as exc:
+            log.warning(f"Insert error: {exc}",
+                        extra={"stage": "import", "status": "WARN"})
+
+    # Export updated file for that source
+    source_leads = get_leads_by_source(source)
+    deduped_src, _ = deduplicate(source_leads)
+    out = export_excel(deduped_src, source_label=source)
+
+    print()
+    print("=" * 60)
+    print("  CSV IMPORT SUMMARY")
+    print("=" * 60)
+    print(f"  File             : {csv_path}")
+    print(f"  Source           : {source}")
+    print(f"  Rows imported    : {imported}")
+    print(f"  Rows skipped     : {skipped}")
+    print(f"  Duplicates merged: {merged}")
+    print(f"  Final lead count : {len(deduped_src)}")
+    print(f"  Output file      : {out}")
+    print("=" * 60)
+
+
+# ── Scrape pipeline ───────────────────────────────────────────────────────────
+
+def _run_scrape(source: str) -> None:
     start_time = datetime.utcnow()
-    log.info("=== Run started ===", extra={"stage": "main", "status": "START"})
+    log.info(f"=== Run started (--source {source}) ===",
+             extra={"stage": "main", "status": "START"})
 
     init_db()
 
-    scrapers  = [TradeIndiaScraper(), MeeshoScraper()]
-    products  = settings.products   # ["Rose Water"]
+    scrapers = _select_scrapers(source)
+    products = settings.products
 
     stats = {
         "listings_found":    0,
@@ -52,32 +143,32 @@ def run() -> None:
         "blocked_pages":     0,
         "failed_pages":      0,
         "duplicates_merged": 0,
-        "selector_broken":   0,   # Phase 7: selector health check
-        "resumed_from_db":   0,   # Phase 7: DONE URLs carried from a prior run
+        "selector_broken":   0,
+        "resumed_from_db":   0,
+        "is_resumed_run":    False,
     }
 
     for scraper in scrapers:
-        source = scraper.source_name
-        log.info(f"--- Source: {source} ---",
-                 extra={"source": source, "stage": "main", "status": "START"})
+        src = scraper.source_name
+        log.info(f"--- Source: {src} ---",
+                 extra={"source": src, "stage": "main", "status": "START"})
 
         consecutive_blocks = 0
 
-        # ── Phase A: URL discovery ─────────────────────────────────────────
-        # Skip if:  (a) scraper is an inactive no-op, OR
-        #           (b) this source already has URLs in DB (resume after crash).
+        # ── Phase A: URL discovery ────────────────────────────────────────
         do_discovery = scraper.is_active
         if do_discovery:
-            existing = count_by_status(source)
-            already_known = sum(existing.values())
+            existing_counts = count_by_status(src)
+            already_known   = sum(existing_counts.values())
             if already_known > 0:
-                done_n    = existing.get("DONE", 0)
-                pending_n = existing.get("PENDING", 0)
+                done_n    = existing_counts.get("DONE", 0)
+                pending_n = existing_counts.get("PENDING", 0)
                 stats["resumed_from_db"] += done_n
+                stats["is_resumed_run"]   = True
                 log.info(
-                    f"{source}: resuming — {done_n} DONE, {pending_n} PENDING "
+                    f"{src}: resuming — {done_n} DONE, {pending_n} PENDING "
                     "in DB (skipping re-discovery)",
-                    extra={"source": source, "stage": "main", "status": "RESUME",
+                    extra={"source": src, "stage": "main", "status": "RESUME",
                            "done": done_n, "pending": pending_n},
                 )
                 do_discovery = False
@@ -88,21 +179,26 @@ def run() -> None:
                 if outer_break:
                     break
                 for page in range(1, settings.max_pages + 1):
-                    profile_urls = scraper.search_listings(keyword, page)
+                    if hasattr(scraper, "search_listings_meta"):
+                        entries      = scraper.search_listings_meta(keyword, page)
+                        profile_urls = [e["profile_url"] for e in entries]
+                    else:
+                        entries      = []
+                        profile_urls = scraper.search_listings(keyword, page)
 
                     if not profile_urls:
                         consecutive_blocks += 1
                         stats["selector_broken"] += 1
                         log.warning(
-                            f"SELECTOR_BROKEN {source} — page {page} returned 0 URLs",
-                            extra={"source": source, "stage": "search",
+                            f"SELECTOR_BROKEN {src} — page {page} returned 0 URLs",
+                            extra={"source": src, "stage": "search",
                                    "status": "SELECTOR_BROKEN", "page": page},
                         )
                         if consecutive_blocks >= _MAX_CONSEC_BLOCKS:
                             log.warning(
-                                f"{source}: {_MAX_CONSEC_BLOCKS} consecutive empty "
+                                f"{src}: {_MAX_CONSEC_BLOCKS} consecutive empty "
                                 "pages — stopping source",
-                                extra={"source": source, "stage": "main",
+                                extra={"source": src, "stage": "main",
                                        "status": "SOURCE_STOPPED"},
                             )
                             outer_break = True
@@ -111,58 +207,67 @@ def run() -> None:
 
                     consecutive_blocks = 0
                     stats["listings_found"] += len(profile_urls)
+                    meta_by_url = {e["profile_url"]: e for e in entries}
 
                     for url in profile_urls:
                         if get_url_status(url) is None:
-                            upsert_url(url, source, "PENDING")
+                            meta = meta_by_url.get(url)
+                            upsert_url(url, src, "PENDING", metadata=meta)
         else:
-            # Inactive no-op: trigger the one-time block log (Meesho only).
+            # Inactive no-op: log Meesho block once
             if not scraper.is_active:
                 scraper.search_listings("", 1)
 
-        # ── Phase B: fetch → parse → normalise → store ─────────────────────
-        pending = get_pending_urls(source)
+        # ── Phase B: fetch → parse → normalise → store ────────────────────
+        pending = get_pending_urls(src)
         log.info(
-            f"{source}: {len(pending)} URLs to fetch",
-            extra={"source": source, "stage": "main",
+            f"{src}: {len(pending)} URLs to fetch",
+            extra={"source": src, "stage": "main",
                    "status": "PENDING", "count": len(pending)},
         )
 
-        for url in pending:
-            # Fetch
+        for i, url in enumerate(pending, start=1):
+            # Progress log every 10 URLs
+            if i % 10 == 0 or i == 1 or i == len(pending):
+                log.info(
+                    f"{src}: {i}/{len(pending)} processed "
+                    f"(parsed={stats['leads_parsed']}, "
+                    f"blocked={stats['blocked_pages']}, "
+                    f"failed={stats['failed_pages']})",
+                    extra={"source": src, "stage": "progress",
+                           "processed": i, "total": len(pending)},
+                )
             try:
                 html = fetch_html(url)
                 stats["listings_fetched"] += 1
             except RobotsDisallowedError:
-                upsert_url(url, source, "BLOCKED", "robots.txt disallowed")
+                upsert_url(url, src, "BLOCKED", "robots.txt disallowed")
                 stats["blocked_pages"] += 1
                 log.warning("robots.txt blocked",
-                            extra={"source": source, "url": url,
+                            extra={"source": src, "url": url,
                                    "stage": "fetch", "status": "BLOCKED"})
                 continue
             except BlockedError as exc:
-                upsert_url(url, source, "BLOCKED", f"HTTP {exc.status_code}")
+                upsert_url(url, src, "BLOCKED", f"HTTP {exc.status_code}")
                 stats["blocked_pages"] += 1
                 consecutive_blocks += 1
                 log.warning("Page blocked",
-                            extra={"source": source, "url": url,
-                                   "stage": "fetch", "status": "BLOCKED",
-                                   "http_code": exc.status_code})
+                            extra={"source": src, "url": url, "stage": "fetch",
+                                   "status": "BLOCKED", "http_code": exc.status_code})
                 if consecutive_blocks >= _MAX_CONSEC_BLOCKS:
                     log.warning(
-                        f"{source}: too many consecutive blocks — stopping source",
-                        extra={"source": source, "stage": "main",
+                        f"{src}: too many consecutive blocks — stopping source",
+                        extra={"source": src, "stage": "main",
                                "status": "SOURCE_STOPPED"},
                     )
                     break
                 continue
             except Exception as exc:
-                upsert_url(url, source, "FAILED", str(exc))
+                upsert_url(url, src, "FAILED", str(exc))
                 stats["failed_pages"] += 1
                 log.error("Fetch error",
-                          extra={"source": source, "url": url,
-                                 "stage": "fetch", "status": "FAILED",
-                                 "error": str(exc)})
+                          extra={"source": src, "url": url, "stage": "fetch",
+                                 "status": "FAILED", "error": str(exc)})
                 continue
 
             consecutive_blocks = 0
@@ -170,52 +275,89 @@ def run() -> None:
             # Parse
             lead = scraper.parse_listing(html, url)
             if lead is None:
-                upsert_url(url, source, "DONE")
+                upsert_url(url, src, "DONE")
                 stats["leads_skipped"] += 1
                 continue
 
-            # Normalise (runs phone + email validation)
+            # Merge listing-time metadata (product_name, product_url)
+            meta = get_url_metadata(url)
+            if meta and not lead.product_name:
+                try:
+                    lead = lead.model_copy(update={
+                        "product_name": meta.get("product_name") or lead.product_name,
+                        "product_url":  lead.product_url or meta.get("product_url"),
+                    })
+                except Exception:
+                    pass
+
+            # Normalise
             try:
                 lead = normalise_lead(lead)
             except Exception as exc:
                 log.warning("Normalisation failed",
-                            extra={"source": source, "url": url,
+                            extra={"source": src, "url": url,
                                    "stage": "normalise", "status": "WARN",
                                    "error": str(exc)})
 
             # Store
             try:
                 insert_lead(lead)
-                upsert_url(url, source, "DONE")
+                upsert_url(url, src, "DONE")
                 stats["leads_parsed"] += 1
                 log.info(f"Stored: {lead.company_name}",
-                         extra={"source": source, "url": url,
+                         extra={"source": src, "url": url,
                                 "stage": "store", "status": "OK"})
             except Exception as exc:
-                upsert_url(url, source, "FAILED", str(exc))
+                upsert_url(url, src, "FAILED", str(exc))
                 log.error("DB insert failed",
-                          extra={"source": source, "url": url,
-                                 "stage": "store", "status": "FAILED",
-                                 "error": str(exc)})
+                          extra={"source": src, "url": url, "stage": "store",
+                                 "status": "FAILED", "error": str(exc)})
 
-    # ── Deduplicate ───────────────────────────────────────────────────────────
-    all_leads = get_all_leads()
-    deduped, merged = deduplicate(all_leads)
+    # ── Deduplicate ───────────────────────────────────────────────────────
+    all_db_leads = get_all_leads()
+    deduped_all, merged = deduplicate(all_db_leads)
     stats["duplicates_merged"] = merged
 
-    # ── Export ────────────────────────────────────────────────────────────────
-    output_path = export_excel(deduped, run_stats=stats)
+    # ── Per-source exports ────────────────────────────────────────────────
+    output_paths: List[Path] = []
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    elapsed     = (datetime.utcnow() - start_time).total_seconds()
-    phone_valid  = sum(1 for l in deduped if l.phone_status == "VALID")
-    phone_hidden = sum(1 for l in deduped if l.phone_status == "HIDDEN")
-    email_valid  = sum(1 for l in deduped if l.email_status == "VALID")
+    if source in ("tradeindia", "all"):
+        ti_leads = [l for l in deduped_all if "TradeIndia" in (l.source or "")]
+        if ti_leads:
+            p = export_excel(ti_leads, run_stats=stats, source_label="tradeindia")
+            output_paths.append(p)
 
+    if source in ("meesho", "all"):
+        me_leads = [l for l in deduped_all if "Meesho" in (l.source or "")]
+        if me_leads:
+            p = export_excel(me_leads, run_stats=stats, source_label="meesho")
+            output_paths.append(p)
+        else:
+            # Meesho was blocked — create the informational blocked sheet
+            p = export_meesho_blocked()
+            output_paths.append(p)
+
+    if source == "all":
+        p = export_excel(deduped_all, run_stats=stats, source_label="all")
+        output_paths.append(p)
+
+    # Legacy combined file (keeps old behaviour for tools that reference it)
+    export_excel(deduped_all, run_stats=stats,
+                 output_path=settings.output_file_abs)
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    elapsed      = (datetime.utcnow() - start_time).total_seconds()
+    phone_valid  = sum(1 for l in deduped_all if l.phone_status == "VALID")
+    phone_hidden = sum(1 for l in deduped_all if l.phone_status == "HIDDEN")
+    email_valid  = sum(1 for l in deduped_all if l.email_status == "VALID")
+
+    run_label = ("  END-OF-RUN SUMMARY (RESUMED RUN)"
+                 if stats["is_resumed_run"] else "  END-OF-RUN SUMMARY")
     print()
     print("=" * 60)
-    print("  END-OF-RUN SUMMARY")
+    print(run_label)
     print("=" * 60)
+    print(f"  Source filter        : --source {source}")
     print(f"  Listings found       : {stats['listings_found']}")
     print(f"  Listings fetched     : {stats['listings_fetched']}")
     print(f"  Leads parsed         : {stats['leads_parsed']}")
@@ -225,19 +367,33 @@ def run() -> None:
     print(f"  Selector broken      : {stats['selector_broken']}")
     print(f"  Resumed from DB      : {stats['resumed_from_db']}")
     print(f"  Duplicates merged    : {merged}")
-    print(f"  Final lead count     : {len(deduped)}")
+    print(f"  Final lead count     : {len(deduped_all)}")
     print(f"  Phone: VALID/HIDDEN  : {phone_valid} / {phone_hidden}")
     print(f"  Email: VALID         : {email_valid}")
-    print(f"  Output file          : {output_path}")
+    for p in output_paths:
+        print(f"  Output file          : {p}")
     print(f"  Elapsed              : {elapsed:.1f}s")
     print("=" * 60)
     print()
 
     log.info("=== Run complete ===", extra={
         "stage": "main", "status": "DONE",
-        "leads": len(deduped), "output": str(output_path),
+        "leads": len(deduped_all),
+        "outputs": [str(p) for p in output_paths],
         "elapsed_s": elapsed, **stats,
     })
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def run(argv=None) -> None:
+    args = _parse_args(argv)
+
+    if args.import_csv:
+        csv_path = Path(args.import_csv)
+        _run_import(csv_path, args.source if args.source != "all" else "Meesho")
+    else:
+        _run_scrape(args.source)
 
 
 if __name__ == "__main__":

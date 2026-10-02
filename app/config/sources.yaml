@@ -3,16 +3,29 @@
 
 tradeindia:
   base_url: "https://www.tradeindia.com"
-  # Listing page: /manufacturers/{keyword-slug}.html
-  # keyword slug = keyword lowercased, spaces replaced with hyphens
-  listing_url_template: "https://www.tradeindia.com/manufacturers/{keyword_slug}.html"
-  # Path-based pagination (query-param ?page= is disallowed by robots.txt)
-  # TradeIndia uses /manufacturers/{slug}-{page}.html for pages 2+
-  listing_page2_template: "https://www.tradeindia.com/manufacturers/{keyword_slug}-{page}.html"
-  profile_url_prefix: "https://www.tradeindia.com"  # profile_url from JSON is relative
   robots_txt: "https://www.tradeindia.com/robots.txt"
   # How many consecutive blocked responses before we stop this source
   max_consecutive_blocks: 5
+
+  # ── Listing categories ────────────────────────────────────────────────────
+  # Each category defines URL templates for pages 1 and 2+.
+  # keyword_slug = keyword lowercased, spaces → hyphens (e.g. "rose-water").
+  # Adding a new category here is all that is needed — no Python changes required.
+  listing_categories:
+    - name: "manufacturers"
+      page1_template: "https://www.tradeindia.com/manufacturers/{keyword_slug}.html"
+      page2_template: "https://www.tradeindia.com/manufacturers/{keyword_slug}-{page}.html"
+    - name: "suppliers"
+      page1_template: "https://www.tradeindia.com/suppliers/{keyword_slug}.html"
+      page2_template: "https://www.tradeindia.com/suppliers/{keyword_slug}-{page}.html"
+    - name: "exporters"
+      page1_template: "https://www.tradeindia.com/exporters/{keyword_slug}.html"
+      page2_template: "https://www.tradeindia.com/exporters/{keyword_slug}-{page}.html"
+
+  # Legacy single-template fields kept for backward compatibility with existing tests
+  listing_url_template: "https://www.tradeindia.com/manufacturers/{keyword_slug}.html"
+  listing_page2_template: "https://www.tradeindia.com/manufacturers/{keyword_slug}-{page}.html"
+  profile_url_prefix: "https://www.tradeindia.com"
 
   # __NEXT_DATA__ JSON paths (dot-notation, evaluated by the scraper)
   next_data_paths:
