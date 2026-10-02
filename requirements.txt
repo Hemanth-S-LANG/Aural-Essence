@@ -1,0 +1,35 @@
+# HTTP + parsing
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.2.2
+
+# JS-rendered pages (fallback only, controlled by USE_PLAYWRIGHT env flag)
+playwright==1.44.0
+
+# Retry logic
+tenacity==8.3.0
+
+# Phone validation
+phonenumbers==8.13.39
+
+# Email validation
+email-validator==2.1.1
+
+# Fuzzy matching for deduplication
+rapidfuzz==3.9.3
+
+# Data / export
+pandas==2.2.2
+openpyxl==3.1.4
+
+# Config / models
+pydantic==2.7.4
+pydantic-settings==2.3.4
+python-dotenv==1.0.1
+
+# YAML config
+PyYAML==6.0.1
+
+# Testing
+pytest==8.2.2
+pytest-mock==3.14.0

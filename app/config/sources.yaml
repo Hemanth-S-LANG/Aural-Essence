@@ -1,0 +1,71 @@
+# Per-source configuration.
+# Scrapers read URL templates and selectors from here — not hardcoded in Python.
+
+tradeindia:
+  base_url: "https://www.tradeindia.com"
+  # Listing page: /manufacturers/{keyword-slug}.html
+  # keyword slug = keyword lowercased, spaces replaced with hyphens
+  listing_url_template: "https://www.tradeindia.com/manufacturers/{keyword_slug}.html"
+  # Path-based pagination (query-param ?page= is disallowed by robots.txt)
+  # TradeIndia uses /manufacturers/{slug}-{page}.html for pages 2+
+  listing_page2_template: "https://www.tradeindia.com/manufacturers/{keyword_slug}-{page}.html"
+  profile_url_prefix: "https://www.tradeindia.com"  # profile_url from JSON is relative
+  robots_txt: "https://www.tradeindia.com/robots.txt"
+  # How many consecutive blocked responses before we stop this source
+  max_consecutive_blocks: 5
+
+  # __NEXT_DATA__ JSON paths (dot-notation, evaluated by the scraper)
+  next_data_paths:
+    # Manufacturer listing page
+    listing_sellers: "props.pageProps.initialState.manufacturer.manufacturer_page.manufacturer_page_res.mcatData.listing_data.listing_data"
+    # Seller profile page
+    profile_company: "props.pageProps.initialState.sellerProfile.seller_profile.seller_profile_res.company_details_data"
+    # Product detail page
+    pdp_product:     "props.pageProps.initialState.product.PDP_page.PDP_page_res.product_details"
+    pdp_company:     "props.pageProps.initialState.product.PDP_page.PDP_page_res.company_details"
+
+  # Field mappings: Lead field → JSON key within the relevant block
+  listing_field_map:
+    company_name:  "co_name"
+    city:          "city"
+    state:         "state"
+    product_name:  "product_name"
+    product_url:   "prod_url"       # relative; prepend base_url
+    profile_url:   "profile_url"    # relative; prepend base_url
+    number_mask:   "number_mask"
+
+  profile_field_map:
+    company_name:    "co_name"
+    contact_person:  "owner_name"
+    designation:     "desg"
+    address:         "address"
+    city:            "city"
+    state:           "state"
+    gst_no:          "gst_no"
+    number_mask:     "number_mask"
+    phone:           "mobile"       # always None when number_mask=true
+    email:           "email"        # always None
+
+  pdp_company_field_map:
+    company_name:    "co_name"
+    contact_person:  "owner_name"
+    designation:     "desg"
+    address:         "address"
+    city:            "city"
+    state:           "state"
+    gst_no:          "gst_no"
+    number_mask:     "number_mask"
+
+  # CSS selectors (fallback only, used if __NEXT_DATA__ is absent/broken)
+  css_selectors:
+    company_name:   "h1"
+    address:        "[class*='address']"
+    phone:          "[class*='phone'], [class*='mobile']"
+
+meesho:
+  base_url: "https://www.meesho.com"
+  robots_txt: "https://www.meesho.com/robots.txt"
+  # WAF-blocked (Akamai 403) + D2C marketplace with no B2B contact info.
+  # MeeshoScraper is a graceful no-op; these values are documentary only.
+  blocked: true
+  block_reason: "SCOPE_MISMATCH: D2C marketplace, no B2B contact info publicly available. All requests blocked by Akamai EdgeSuite WAF (HTTP 403)."
