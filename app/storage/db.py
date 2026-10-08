@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS leads (
     product_name    TEXT,
     product_url     TEXT,
     extra_product_urls TEXT,        -- JSON array
+    products_count  INTEGER NOT NULL DEFAULT 0,
     source          TEXT NOT NULL,
     phone_status    TEXT NOT NULL DEFAULT 'MISSING',
     email_status    TEXT NOT NULL DEFAULT 'MISSING',
@@ -67,9 +68,24 @@ CREATE TABLE IF NOT EXISTS leads (
 );
 """
 
-# Migration: add phone_source / email_source to existing DBs
-_MIGRATE_LEADS_PHONE_SOURCE = "ALTER TABLE leads ADD COLUMN phone_source TEXT NOT NULL DEFAULT 'SCRAPED';"
-_MIGRATE_LEADS_EMAIL_SOURCE = "ALTER TABLE leads ADD COLUMN email_source TEXT NOT NULL DEFAULT 'SCRAPED';"
+_DDL_PRODUCTS = """
+CREATE TABLE IF NOT EXISTS products (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_name    TEXT NOT NULL,
+    product_url     TEXT,
+    company_name    TEXT NOT NULL,
+    profile_url     TEXT,
+    source          TEXT NOT NULL,
+    scraped_at      TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    UNIQUE(product_url, company_name)
+);
+"""
+
+# Migrations for existing DBs
+_MIGRATE_LEADS_PHONE_SOURCE   = "ALTER TABLE leads ADD COLUMN phone_source TEXT NOT NULL DEFAULT 'SCRAPED';"
+_MIGRATE_LEADS_EMAIL_SOURCE   = "ALTER TABLE leads ADD COLUMN email_source TEXT NOT NULL DEFAULT 'SCRAPED';"
+_MIGRATE_LEADS_PRODUCTS_COUNT = "ALTER TABLE leads ADD COLUMN products_count INTEGER NOT NULL DEFAULT 0;"
 
 
 # ── Connection helper ─────────────────────────────────────────────────────────
@@ -97,6 +113,7 @@ def init_db() -> None:
     with _conn() as con:
         con.execute(_DDL_URL_STATUS)
         con.execute(_DDL_LEADS)
+        con.execute(_DDL_PRODUCTS)
         # Non-destructive migrations
         url_cols  = {row[1] for row in con.execute("PRAGMA table_info(url_status)")}
         lead_cols = {row[1] for row in con.execute("PRAGMA table_info(leads)")}
@@ -106,6 +123,8 @@ def init_db() -> None:
             con.execute(_MIGRATE_LEADS_PHONE_SOURCE)
         if "email_source" not in lead_cols:
             con.execute(_MIGRATE_LEADS_EMAIL_SOURCE)
+        if "products_count" not in lead_cols:
+            con.execute(_MIGRATE_LEADS_PRODUCTS_COUNT)
     log.info("DB initialised", extra={"stage": "db", "status": "OK",
                                        "path": str(settings.db_path_abs)})
 
@@ -175,16 +194,17 @@ def insert_lead(lead: Lead) -> int:
             INSERT INTO leads (
                 company_name, contact_person, designation,
                 phone_number, email, address, city, state, gst_no,
-                product_name, product_url, extra_product_urls,
+                product_name, product_url, extra_product_urls, products_count,
                 source, phone_status, email_status, phone_source, email_source,
                 scraped_at, raw_url, created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             lead.company_name, lead.contact_person, lead.designation,
             lead.phone_number, lead.email,
             lead.address, lead.city, lead.state, lead.gst_no,
             lead.product_name, lead.product_url,
             json.dumps(lead.extra_product_urls),
+            lead.products_count,
             lead.source, lead.phone_status, lead.email_status,
             lead.phone_source, lead.email_source,
             lead.scraped_at.isoformat() if lead.scraped_at else now,
@@ -234,4 +254,48 @@ def get_leads_by_source(source: str) -> List[Lead]:
 def count_leads() -> int:
     with _conn() as con:
         row = con.execute("SELECT COUNT(*) as n FROM leads").fetchone()
+    return row["n"]
+
+
+# ── products table ────────────────────────────────────────────────────────────
+
+def upsert_product(product_name: str, product_url: Optional[str],
+                   company_name: str, profile_url: Optional[str],
+                   source: str) -> None:
+    """Insert or ignore a product entry (unique on product_url + company_name)."""
+    now = datetime.utcnow().isoformat()
+    with _conn() as con:
+        con.execute("""
+            INSERT INTO products (product_name, product_url, company_name,
+                                  profile_url, source, scraped_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(product_url, company_name) DO UPDATE SET
+                product_name = excluded.product_name,
+                scraped_at   = excluded.scraped_at
+        """, (product_name, product_url or "", company_name,
+              profile_url, source, now, now))
+
+
+def get_all_products() -> List[dict]:
+    """Return all products as plain dicts (for Excel export)."""
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT product_name, product_url, company_name, "
+            "profile_url, source, scraped_at FROM products ORDER BY id"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_products() -> int:
+    with _conn() as con:
+        row = con.execute("SELECT COUNT(*) as n FROM products").fetchone()
+    return row["n"]
+
+
+def count_products_for_company(company_name: str) -> int:
+    with _conn() as con:
+        row = con.execute(
+            "SELECT COUNT(*) as n FROM products WHERE company_name = ?",
+            (company_name,)
+        ).fetchone()
     return row["n"]

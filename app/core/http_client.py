@@ -64,6 +64,9 @@ def _get_robots(domain: str) -> urllib.robotparser.RobotFileParser:
         log.warning("robots.txt fetch failed — treating all paths as allowed",
                     extra={"source": domain, "url": robots_url,
                            "stage": "robots", "status": "WARN", "error": str(exc)})
+        # An empty RobotFileParser.can_fetch() returns False by default,
+        # which would wrongly block everything. Explicitly allow all instead.
+        rp.allow_all = True
     _robots_cache[domain] = rp
     return rp
 

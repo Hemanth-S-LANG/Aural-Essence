@@ -11,16 +11,15 @@ tradeindia:
   # Each category defines URL templates for pages 1 and 2+.
   # keyword_slug = keyword lowercased, spaces → hyphens (e.g. "rose-water").
   # Adding a new category here is all that is needed — no Python changes required.
+  #
+  # NOTE (2026-10-04):
+  #   - /suppliers/{slug}.html  — DISALLOWED by robots.txt → removed
+  #   - /exporters/{slug}.html  — returns HTTP 404 → removed
+  #   Only /manufacturers/ works.
   listing_categories:
     - name: "manufacturers"
       page1_template: "https://www.tradeindia.com/manufacturers/{keyword_slug}.html"
       page2_template: "https://www.tradeindia.com/manufacturers/{keyword_slug}-{page}.html"
-    - name: "suppliers"
-      page1_template: "https://www.tradeindia.com/suppliers/{keyword_slug}.html"
-      page2_template: "https://www.tradeindia.com/suppliers/{keyword_slug}-{page}.html"
-    - name: "exporters"
-      page1_template: "https://www.tradeindia.com/exporters/{keyword_slug}.html"
-      page2_template: "https://www.tradeindia.com/exporters/{keyword_slug}-{page}.html"
 
   # Legacy single-template fields kept for backward compatibility with existing tests
   listing_url_template: "https://www.tradeindia.com/manufacturers/{keyword_slug}.html"

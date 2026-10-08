@@ -40,6 +40,7 @@ class Lead(BaseModel):
     product_name:   Optional[str] = None
     product_url:    Optional[str] = None   # absolute URL to the product/listing page
     source:         str = ""               # "TradeIndia" | "Meesho"
+    products_count: int = 0               # total products found for this seller
 
     # ── Validation status ─────────────────────────────────────────────────────
     phone_status:   str = "MISSING"        # VALID | INVALID | HIDDEN | MISSING

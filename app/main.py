@@ -34,9 +34,11 @@ from app.processors.deduplicator import deduplicate
 from app.processors.normalizer import normalise_lead
 from app.scrapers.meesho_scraper import MeeshoScraper
 from app.scrapers.tradeindia_scraper import TradeIndiaScraper
+from app.scrapers.ti_pagination_collector import collect_listing_pages
 from app.storage.db import (
-    count_by_status, get_all_leads, get_leads_by_source, get_pending_urls,
-    init_db, insert_lead, upsert_url, get_url_status, get_url_metadata,
+    count_by_status, get_all_leads, get_all_products, get_leads_by_source,
+    get_pending_urls, init_db, insert_lead, upsert_url, upsert_product,
+    get_url_status, get_url_metadata, count_products,
 )
 
 log = get_logger(__name__)
@@ -147,6 +149,7 @@ def _run_scrape(source: str) -> None:
         "resumed_from_db":   0,
         "is_resumed_run":    False,
     }
+    block_count = 0   # cumulative blocks across all sources (for TradeIndia collector)
 
     for scraper in scrapers:
         src = scraper.source_name
@@ -174,45 +177,70 @@ def _run_scrape(source: str) -> None:
                 do_discovery = False
 
         if do_discovery:
-            outer_break = False
-            for keyword in products:
-                if outer_break:
-                    break
-                for page in range(1, settings.max_pages + 1):
-                    if hasattr(scraper, "search_listings_meta"):
-                        entries      = scraper.search_listings_meta(keyword, page)
-                        profile_urls = [e["profile_url"] for e in entries]
-                    else:
-                        entries      = []
-                        profile_urls = scraper.search_listings(keyword, page)
-
-                    if not profile_urls:
-                        consecutive_blocks += 1
-                        stats["selector_broken"] += 1
-                        log.warning(
-                            f"SELECTOR_BROKEN {src} — page {page} returned 0 URLs",
-                            extra={"source": src, "stage": "search",
-                                   "status": "SELECTOR_BROKEN", "page": page},
+            if src == "TradeIndia":
+                # Use Playwright pagination collector (Option A)
+                # One browser session, pages 1..N via browser fetch with session cookies
+                for keyword in products:
+                    entries, total_pages, blk = collect_listing_pages(
+                        keyword, max_pages=settings.max_pages
+                    )
+                    stats["listings_found"] += len(entries)
+                    block_count             += blk
+                    if total_pages:
+                        log.info(
+                            f"TradeIndia: {len(entries)} unique sellers across "
+                            f"{min(settings.max_pages, total_pages)}/{total_pages} pages",
+                            extra={"source": src, "stage": "main",
+                                   "total_pages": total_pages},
                         )
-                        if consecutive_blocks >= _MAX_CONSEC_BLOCKS:
+                    # collect_listing_pages already upserted URLs;
+                    # count how many are new vs already known
+                    new_pending = count_by_status(src).get("PENDING", 0)
+                    log.info(
+                        f"TradeIndia: {new_pending} profile URLs now PENDING",
+                        extra={"source": src, "stage": "main"},
+                    )
+            else:
+                # Fallback: requests-based search_listings_meta (Meesho no-op)
+                outer_break = False
+                for keyword in products:
+                    if outer_break:
+                        break
+                    for page in range(1, settings.max_pages + 1):
+                        if hasattr(scraper, "search_listings_meta"):
+                            entries      = scraper.search_listings_meta(keyword, page)
+                            profile_urls = [e["profile_url"] for e in entries]
+                        else:
+                            entries      = []
+                            profile_urls = scraper.search_listings(keyword, page)
+
+                        if not profile_urls:
+                            consecutive_blocks += 1
+                            stats["selector_broken"] += 1
                             log.warning(
-                                f"{src}: {_MAX_CONSEC_BLOCKS} consecutive empty "
-                                "pages — stopping source",
-                                extra={"source": src, "stage": "main",
-                                       "status": "SOURCE_STOPPED"},
+                                f"SELECTOR_BROKEN {src} — page {page} returned 0 URLs",
+                                extra={"source": src, "stage": "search",
+                                       "status": "SELECTOR_BROKEN", "page": page},
                             )
-                            outer_break = True
-                            break
-                        continue
+                            if consecutive_blocks >= _MAX_CONSEC_BLOCKS:
+                                log.warning(
+                                    f"{src}: {_MAX_CONSEC_BLOCKS} consecutive empty "
+                                    "pages — stopping source",
+                                    extra={"source": src, "stage": "main",
+                                           "status": "SOURCE_STOPPED"},
+                                )
+                                outer_break = True
+                                break
+                            continue
 
-                    consecutive_blocks = 0
-                    stats["listings_found"] += len(profile_urls)
-                    meta_by_url = {e["profile_url"]: e for e in entries}
+                        consecutive_blocks = 0
+                        stats["listings_found"] += len(profile_urls)
+                        meta_by_url = {e["profile_url"]: e for e in entries}
 
-                    for url in profile_urls:
-                        if get_url_status(url) is None:
-                            meta = meta_by_url.get(url)
-                            upsert_url(url, src, "PENDING", metadata=meta)
+                        for url in profile_urls:
+                            if get_url_status(url) is None:
+                                meta = meta_by_url.get(url)
+                                upsert_url(url, src, "PENDING", metadata=meta)
         else:
             # Inactive no-op: log Meesho block once
             if not scraper.is_active:
@@ -307,6 +335,25 @@ def _run_scrape(source: str) -> None:
                 log.info(f"Stored: {lead.company_name}",
                          extra={"source": src, "url": url,
                                 "stage": "store", "status": "OK"})
+                # Record product in the products table
+                if lead.product_name:
+                    upsert_product(
+                        product_name = lead.product_name,
+                        product_url  = lead.product_url,
+                        company_name = lead.company_name,
+                        profile_url  = lead.raw_url,
+                        source       = src,
+                    )
+                # Also record any extra product URLs from metadata
+                meta = get_url_metadata(url)
+                if meta and meta.get("product_name") and lead.product_name != meta.get("product_name"):
+                    upsert_product(
+                        product_name = meta["product_name"],
+                        product_url  = meta.get("product_url"),
+                        company_name = lead.company_name,
+                        profile_url  = url,
+                        source       = src,
+                    )
             except Exception as exc:
                 upsert_url(url, src, "FAILED", str(exc))
                 log.error("DB insert failed",
@@ -318,32 +365,53 @@ def _run_scrape(source: str) -> None:
     deduped_all, merged = deduplicate(all_db_leads)
     stats["duplicates_merged"] = merged
 
+    # ── Fetch products for export ─────────────────────────────────────────
+    all_products = get_all_products()
+
+    # Update products_count on each lead (in-memory, not stored back to DB)
+    prod_count_by_co = {}
+    for p in all_products:
+        co = p["company_name"]
+        prod_count_by_co[co] = prod_count_by_co.get(co, 0) + 1
+    deduped_all_with_counts = []
+    for lead in deduped_all:
+        n = prod_count_by_co.get(lead.company_name, 0)
+        if n and n != lead.products_count:
+            lead = lead.model_copy(update={"products_count": n})
+        deduped_all_with_counts.append(lead)
+    deduped_all = deduped_all_with_counts
+
     # ── Per-source exports ────────────────────────────────────────────────
     output_paths: List[Path] = []
 
     if source in ("tradeindia", "all"):
-        ti_leads = [l for l in deduped_all if "TradeIndia" in (l.source or "")]
+        ti_leads    = [l for l in deduped_all if "TradeIndia" in (l.source or "")]
+        ti_products = [p for p in all_products if "TradeIndia" in (p.get("source",""))]
         if ti_leads:
-            p = export_excel(ti_leads, run_stats=stats, source_label="tradeindia")
+            p = export_excel(ti_leads, run_stats=stats, source_label="tradeindia",
+                             products=ti_products)
             output_paths.append(p)
 
     if source in ("meesho", "all"):
-        me_leads = [l for l in deduped_all if "Meesho" in (l.source or "")]
+        me_leads    = [l for l in deduped_all if "Meesho" in (l.source or "")]
+        me_products = [p for p in all_products if "Meesho" in (p.get("source",""))]
         if me_leads:
-            p = export_excel(me_leads, run_stats=stats, source_label="meesho")
+            p = export_excel(me_leads, run_stats=stats, source_label="meesho",
+                             products=me_products)
             output_paths.append(p)
         else:
-            # Meesho was blocked — create the informational blocked sheet
             p = export_meesho_blocked()
             output_paths.append(p)
 
     if source == "all":
-        p = export_excel(deduped_all, run_stats=stats, source_label="all")
+        p = export_excel(deduped_all, run_stats=stats, source_label="all",
+                         products=all_products)
         output_paths.append(p)
 
-    # Legacy combined file (keeps old behaviour for tools that reference it)
+    # Legacy combined file
     export_excel(deduped_all, run_stats=stats,
-                 output_path=settings.output_file_abs)
+                 output_path=settings.output_file_abs,
+                 products=all_products)
 
     # ── Summary ───────────────────────────────────────────────────────────
     elapsed      = (datetime.utcnow() - start_time).total_seconds()
@@ -368,6 +436,7 @@ def _run_scrape(source: str) -> None:
     print(f"  Resumed from DB      : {stats['resumed_from_db']}")
     print(f"  Duplicates merged    : {merged}")
     print(f"  Final lead count     : {len(deduped_all)}")
+    print(f"  Total products       : {len(all_products)}")
     print(f"  Phone: VALID/HIDDEN  : {phone_valid} / {phone_hidden}")
     print(f"  Email: VALID         : {email_valid}")
     for p in output_paths:

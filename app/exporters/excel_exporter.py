@@ -35,12 +35,23 @@ _COLUMNS = [
     ("City",            "city",            False, False),
     ("State",           "state",           False, False),
     ("GST No",          "gst_no",          False, False),
+    ("Products Count",  "products_count",  False, False),  # total products for seller
     ("Product Name",    "product_name",    False, False),
     ("Product URL",     "product_url",     True,  False),   # clickable hyperlink
     ("Source",          "source",          False, False),
     ("Phone Status",    "phone_status",    False, False),
     ("Email Status",    "email_status",    False, False),
     ("Scraped At",      "scraped_at",      False, False),
+]
+
+# Products sheet column definitions
+_PRODUCT_COLUMNS = [
+    ("Product Name",        "product_name",  False),
+    ("Product URL",         "product_url",   True),
+    ("Company Name",        "company_name",  False),
+    ("Seller Profile URL",  "profile_url",   True),
+    ("Source",              "source",        False),
+    ("Scraped At",          "scraped_at",    False),
 ]
 
 # Status → background colour (light tints)
@@ -114,6 +125,7 @@ def export_excel(
     run_stats: Optional[Dict] = None,
     output_path: Optional[Path] = None,
     source_label: Optional[str] = None,
+    products: Optional[List[Dict]] = None,
 ) -> Path:
     """
     Write leads to Excel and return the output path.
@@ -123,6 +135,7 @@ def export_excel(
         run_stats:    optional dict with counts for the Run Summary sheet
         output_path:  explicit path override (otherwise derived from settings + source_label)
         source_label: "tradeindia" | "meesho" | "all" — used to pick the right output path
+        products:     optional list of product dicts for the Products sheet
     """
     if output_path is None:
         if source_label:
@@ -198,9 +211,14 @@ def export_excel(
         for row_idx in range(2, len(leads) + 2):
             ws.row_dimensions[row_idx].height = 15
 
-        # ── Sheet 2: Run Summary ──────────────────────────────────────────────
+        # ── Sheet 2: Products (if available) ──────────────────────────────────
+        if products:
+            ws_prod = wb.create_sheet("Products")
+            _write_products_sheet(ws_prod, products)
+
+        # ── Sheet 3: Run Summary ──────────────────────────────────────────────
         ws2 = wb.create_sheet("Run Summary")
-        _write_summary(ws2, leads, run_stats or {})
+        _write_summary(ws2, leads, run_stats or {}, product_count=len(products) if products else None)
 
         # Save — with PermissionError fallback (file open in Excel / OneDrive lock)
         output_path = _save_workbook(wb, output_path)
@@ -215,7 +233,39 @@ def export_excel(
         raise ExportError(f"Excel export failed: {exc}") from exc
 
 
-def _write_summary(ws, leads: List[Lead], run_stats: Dict) -> None:
+def _write_products_sheet(ws, products: List[Dict]) -> None:
+    """Write the Products sheet — one row per product listing."""
+    # Header
+    for col_idx, (header, _, _) in enumerate(_PRODUCT_COLUMNS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font  = _HEADER_FONT
+        cell.fill  = _HEADER_FILL
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(_PRODUCT_COLUMNS))}1"
+
+    # Data
+    for row_idx, prod in enumerate(products, start=2):
+        for col_idx, (header, key, is_url) in enumerate(_PRODUCT_COLUMNS, start=1):
+            val = prod.get(key, "")
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.font = _DEFAULT_FONT
+            if is_url and val:
+                cell.value     = val
+                cell.hyperlink = val
+                cell.font      = _LINK_FONT
+            else:
+                cell.value = val
+
+    # Auto-size
+    for col_idx, (header, key, _) in enumerate(_PRODUCT_COLUMNS, start=1):
+        vals  = [str(p.get(key, "")) for p in products]
+        width = _col_width(vals, header)
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+
+def _write_summary(ws, leads: List[Lead], run_stats: Dict,
+                   product_count: Optional[int] = None) -> None:
     """Populate the Run Summary sheet."""
     ws.column_dimensions["A"].width = 30
     ws.column_dimensions["B"].width = 25
@@ -230,10 +280,12 @@ def _write_summary(ws, leads: List[Lead], run_stats: Dict) -> None:
 
     r = 1
     _hdr(r, "Run Summary"); r += 1
-    # Last Updated and total lead count — prominent at the top
+    # Last Updated and counts — prominent at the top
     _row(r, "Last Updated",
          datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")); r += 1
-    _row(r, "Total Leads",    len(leads)); r += 1
+    _row(r, "Total Sellers",  len(leads)); r += 1
+    if product_count is not None:
+        _row(r, "Total Products", product_count); r += 1
     r += 1
 
     _hdr(r, "Leads by source"); r += 1

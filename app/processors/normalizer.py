@@ -83,9 +83,9 @@ def normalise_lead(lead: Lead) -> Lead:
         gst_no             = (_clean_text(lead.gst_no) or "").upper() or None,
         product_name       = _clean_text(lead.product_name),
         product_url        = lead.product_url,
+        products_count     = lead.products_count,
         source             = lead.source,
-        phone_status       = phone_status,
-        email_status       = email_status,
+        phone_status       = phone_status,        email_status       = email_status,
         phone_source       = lead.phone_source,   # preserve MANUAL/SCRAPED
         email_source       = lead.email_source,   # preserve MANUAL/SCRAPED
         scraped_at         = lead.scraped_at,

@@ -65,6 +65,7 @@ def _merge(base: Lead, other: Lead) -> Lead:
         product_name   = _best(base.product_name, other.product_name),
         product_url    = primary_url,
         extra_product_urls = extra_urls,
+        products_count = max(base.products_count, other.products_count),
         source         = base.source if base.source == other.source
                          else f"{base.source}+{other.source}",
         phone_status   = p_status,

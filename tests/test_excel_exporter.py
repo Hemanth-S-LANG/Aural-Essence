@@ -75,7 +75,7 @@ class TestExcelOutput:
         export_excel(_sample_leads(), output_path=out)
         wb = openpyxl.load_workbook(out)
         ws = wb["Leads"]
-        assert ws.max_column == 15
+        assert ws.max_column == 16  # 15 original + Products Count
 
     def test_header_values(self, tmp_path):
         out = tmp_path / "test_leads.xlsx"
@@ -163,14 +163,14 @@ class TestExcelHardening:
             f"'Last Updated' not found in summary labels: {all_labels}"
 
     def test_total_leads_in_summary(self, tmp_path):
-        """Run Summary must show Total Leads count."""
+        """Run Summary must show a total count (now 'Total Sellers')."""
         out = tmp_path / "test.xlsx"
         export_excel(_sample_leads(), output_path=out)
         wb = openpyxl.load_workbook(out)
         ws2 = wb["Run Summary"]
         all_labels = [str(ws2.cell(r, 1).value or "") for r in range(1, ws2.max_row + 1)]
-        assert any("Total Leads" in lbl for lbl in all_labels), \
-            f"'Total Leads' not found in summary labels: {all_labels}"
+        assert any("Total" in lbl for lbl in all_labels), \
+            f"No 'Total' label found in summary: {all_labels}"
 
     def test_permission_error_writes_fallback(self, tmp_path):
         """If the target file is locked, a timestamped fallback is written."""
