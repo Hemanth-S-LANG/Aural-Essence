@@ -1,1 +1,94 @@
+# ============================================================
+# Aural Essence Private Limited — .gitignore
+# ============================================================
+
+# ── Secrets & credentials (NEVER push these) ────────────────
 .env
+*.env
+.env.*
+!.env.example
+
+# ── Python cache & compiled files ───────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.pyc
+
+# ── Virtual environments ─────────────────────────────────────
+v/
+venv/
+env/
+.venv/
+ENV/
+
+# ── Test & coverage cache ────────────────────────────────────
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# ── Output Excel / CSV files (large data files) ──────────────
+output/
+scrapeleads/output/
+*.xlsx
+*.csv
+!.env.example
+
+# ── Raw HTML cache (large, re-fetchable) ────────────────────
+data/raw_html/
+
+# ── Checkpoint & database files (runtime state) ─────────────
+data/*.json
+data/*.db
+data/*.sqlite
+*.json
+!.kiro/**/*.json
+!app/config/*.json
+
+# ── Chrome browser profiles (contains personal login data) ──
+chrome_profile/
+*_Profile/
+ChromeProfile/
+
+# ── Logs ─────────────────────────────────────────────────────
+logs/
+*.log
+*.log.*
+
+# ── OS generated files ───────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# ── Editor & IDE files ───────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Kiro AI workspace files (local only) ─────────────────────
+.kiro/
+
+# ── Excel temp lock files ────────────────────────────────────
+~$*.xlsx
+~$*.csv
+~$*.docx
+
+# ── Jupyter notebooks (if any) ──────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Playwright browsers (large, auto-installed) ─────────────
+playwright-report/
+test-results/
