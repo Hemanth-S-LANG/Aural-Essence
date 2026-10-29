@@ -32,6 +32,9 @@ CKPT_DIR.mkdir(exist_ok=True)
 DELAY       = 4.0    # minimum seconds between API/browser calls
 CKPT_EVERY  = 10     # save checkpoint every N sellers (was 25)
 
+# Consecutive "not found" counter — used for backoff
+_consec_miss = 0
+
 
 def get_checkpoint_path(xlsx_path: Path) -> Path:
     return CKPT_DIR / f"fetch_contact_{xlsx_path.stem}.json"
@@ -102,15 +105,11 @@ def visit_url_for_phone(url: str) -> dict:
 
 def process_seller(seller: dict) -> dict:
     """
-    Pure browser pipeline — exactly like a human searching on Google:
-
-      Step 1: Search "Company City contact details" on Google
-              → Read AI Overview (phone right there most of the time)
-      Step 2: Click AI Mode tab on Google
-              → Richer AI answer with more details
-      Step 3: Visit top result pages (JustDial, Sulekha, company website)
-      Step 4: Google Maps as final fallback
+    Pure browser pipeline — exactly like a human searching on Google.
+    Includes backoff when consecutive "not found" rows suggest throttling.
     """
+    global _consec_miss
+
     company = str(seller.get("company_name") or "").strip()
     city    = str(seller.get("city")         or "").strip()
     state   = str(seller.get("state")        or "").strip()
@@ -123,35 +122,45 @@ def process_seller(seller: dict) -> dict:
     location = city or state
     print(f"    {company[:50]:<50} | {location}")
 
-    # ── Step 1+2+3: Google browser search ────────────────────────────────────
-    # Randomised delay — 4 to 7 seconds between searches to avoid CAPTCHA
-    time.sleep(DELAY + random.uniform(0, 3))
+    # ── Backoff when many consecutive misses (Google throttling) ─────────────
+    if _consec_miss >= 5:
+        wait = min(_consec_miss * 8, 90)   # 40s → 48s → 56s ... max 90s
+        print(f"  [backoff] {_consec_miss} consecutive misses — waiting {wait}s...")
+        time.sleep(wait)
+
+    # ── Google browser search ─────────────────────────────────────────────────
+    # 8–15 second delay between searches (slower = less throttling)
+    time.sleep(8 + random.uniform(0, 7))
     result = search_seller_contact(company, city, state, address, delay=2.0)
+
     if result.get("phone"):
         src = result.get("phone_source", "GOOGLE")
         print(f"      ✓ {src}: {result['phone']} | {result.get('notes','')[:60]}")
+        _consec_miss = 0   # reset miss counter on success
         return result
 
-    # ── Step 4: Google Maps fallback ──────────────────────────────────────────
+    # ── Google Maps fallback ──────────────────────────────────────────────────
     time.sleep(DELAY)
     maps = search_google_maps(company, location, delay=3.0)
     if maps.get("phone"):
         print(f"      ✓ MAPS: {maps['phone']} | {maps.get('notes','')[:55]}")
+        _consec_miss = 0
         return maps
 
-    # Maps found a website — visit it
     maps_website = maps.get("website_url", "")
     if maps_website:
         time.sleep(DELAY)
         pg = visit_url_for_phone(maps_website)
         if pg.get("phone"):
             print(f"      ✓ WEBSITE (via Maps): {pg['phone']}")
+            _consec_miss = 0
             return {"phone": pg["phone"], "email": pg.get("email"),
                     "phone_source": "WEBSITE",
                     "source_url": pg.get("source_url", maps_website),
                     "notes": f"From Maps website: {maps_website[:60]}"}
 
-    print(f"      — not found")
+    _consec_miss += 1
+    print(f"      — not found  (miss streak: {_consec_miss})")
     return {"phone": None, "email": None,
             "phone_source": "", "source_url": "",
             "notes": "Not found via Google or Maps"}

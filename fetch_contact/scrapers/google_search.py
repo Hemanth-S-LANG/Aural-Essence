@@ -94,12 +94,7 @@ def close_browser():
 # ── CAPTCHA detection & waiting ───────────────────────────────────────────────
 
 def _has_real_results(page) -> bool:
-    """
-    Returns True if the page has real Google search results loaded.
-    This is the correct way to detect CAPTCHA is gone — not just URL check.
-    After solving CAPTCHA, Google may redirect to a URL that still briefly
-    contains /sorry/ in the redirect chain even though results are showing.
-    """
+    """Returns True if the page has real Google search results loaded."""
     try:
         return page.evaluate(r"""
             () => {
@@ -117,14 +112,37 @@ def _has_real_results(page) -> bool:
 
 
 def _is_captcha(page) -> bool:
-    """Returns True only if CAPTCHA is actively blocking results."""
+    """Returns True if CAPTCHA/sorry page is blocking results."""
     try:
         url = page.url or ""
-        # If on /sorry/ page AND no real results — it's a CAPTCHA
         on_sorry = "/sorry/" in url or "google.com/sorry" in url
         if not on_sorry:
             return False
         return not _has_real_results(page)
+    except Exception:
+        return False
+
+
+def _is_throttled(page) -> bool:
+    """
+    Returns True if Google is silently throttling —
+    page loaded but has NO results AND no CAPTCHA.
+    This is the silent block that causes rows to show 'not found'
+    even though we're not on /sorry/ page.
+    """
+    try:
+        url = page.url or ""
+        # If on /sorry/ — that's CAPTCHA, handled separately
+        if "/sorry/" in url:
+            return False
+        # If on a real Google search URL but no results in DOM — throttled
+        is_google_search = "google.com/search" in url
+        if not is_google_search:
+            return False
+        has_results = _has_real_results(page)
+        # Also check body text length — throttled pages are nearly empty
+        body_len = page.evaluate("() => document.body.innerText.length") or 0
+        return not has_results and body_len < 500
     except Exception:
         return False
 
@@ -190,9 +208,8 @@ def _wait_captcha(page, timeout_min: int = 10) -> bool:
 
 def _search_google(query: str) -> Dict:
     """
-    Navigate to Google, search the query, extract phones/emails from:
-    AI Overview, Knowledge Panel, snippets, full page text.
-    Handles CAPTCHA automatically.
+    Navigate to Google, search the query, extract phones/emails.
+    Handles both CAPTCHA (/sorry/ page) and silent throttling (empty results).
     """
     result = {"phones": [], "emails": [], "urls": [], "raw_text": ""}
     try:
@@ -203,21 +220,41 @@ def _search_google(query: str) -> Dict:
             wait_until="domcontentloaded",
             timeout=25_000,
         )
-        time.sleep(2.5)
+        time.sleep(3)
 
-        # CAPTCHA check
+        # ── CAPTCHA check (/sorry/ page) ─────────────────────────────────
         if _is_captcha(page):
             solved = _wait_captcha(page, timeout_min=10)
             if not solved:
                 return result
-            # If still on sorry page, re-navigate
             if "/sorry/" in (page.url or ""):
                 page.goto(
                     f"https://www.google.com/search?q={encoded}&hl=en&gl=in",
                     wait_until="domcontentloaded",
                     timeout=25_000,
                 )
-                time.sleep(2.5)
+                time.sleep(3)
+
+        # ── Silent throttle check (empty page, no CAPTCHA) ───────────────
+        if _is_throttled(page):
+            wait_secs = random.randint(30, 60)
+            print(f"\n  [!] Google throttling detected — waiting {wait_secs}s...")
+            _bring_chrome_front()
+            time.sleep(wait_secs)
+            # Retry the search once after waiting
+            page.goto(
+                f"https://www.google.com/search?q={encoded}&hl=en&gl=in",
+                wait_until="domcontentloaded",
+                timeout=25_000,
+            )
+            time.sleep(3)
+            # If still throttled/CAPTCHA after backoff — give up on this query
+            if _is_throttled(page) or _is_captcha(page):
+                if _is_captcha(page):
+                    _wait_captcha(page, timeout_min=10)
+                else:
+                    print(f"  [!] Still throttled after backoff — skipping\n")
+                    return result
 
         # Accept cookies if prompted
         for btn_text in ["Accept all", "I agree"]:
