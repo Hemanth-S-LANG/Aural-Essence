@@ -1,21 +1,18 @@
 """
 Google Search scraper — browser automation only. No API keys.
 
-Exactly how a human does it:
-  1. Reuse open Chrome via CDP (port 9222) — has real Google cookies
-  2. Search: "Company City contact details"
-  3. Read AI Overview — phone/email right there most of the time
-  4. If CAPTCHA appears — pause and wait for user to solve it manually
-  5. If no phone in AI Overview — visit top result pages
+Uses the already-open Chrome (CDP port 9222) which has real Google
+cookies — no bot detection normally.
 
-CAPTCHA handling:
-  When Google shows the CAPTCHA page, the script prints a message
-  and waits up to 5 minutes for the user to tick "I am not a robot"
-  in the visible Chrome window, then resumes automatically.
-
-Delays are randomised (4–7s per search) to avoid triggering CAPTCHA.
+When CAPTCHA appears:
+  - Prints a loud message in terminal
+  - Brings Chrome to front
+  - Waits up to 10 min for user to solve it
+  - Detects solve by checking if real search results loaded
+    (checks URL AND DOM — not just URL, which was the bug before)
+  - Resumes automatically once solved
 """
-import re, time, random
+import re, time, random, subprocess
 from typing import Dict, List
 from pathlib import Path
 
@@ -36,8 +33,12 @@ _PAGE    = None
 _PW      = None
 
 
+# ── Browser management ────────────────────────────────────────────────────────
+
 def _get_page():
+    """Get a page — uses existing Chrome via CDP first, then launches fresh."""
     global _BROWSER, _PAGE, _PW
+
     try:
         if _PAGE:
             _PAGE.title()
@@ -47,7 +48,7 @@ def _get_page():
 
     from playwright.sync_api import sync_playwright
 
-    # Try CDP to already-open Chrome first (has real Google cookies)
+    # Try CDP — existing Chrome has real Google cookies
     try:
         pw_tmp = sync_playwright().start()
         browser = pw_tmp.chromium.connect_over_cdp("http://localhost:9222")
@@ -62,12 +63,13 @@ def _get_page():
         try: pw_tmp.stop()
         except Exception: pass
 
-    # Fallback: launch with saved profile
+    # Fallback: launch with saved profile (visible, not headless)
     _PW = sync_playwright().start()
     _BROWSER = _PW.chromium.launch_persistent_context(
         user_data_dir=str(PROFILE_DIR),
         headless=False, channel="chrome",
-        args=["--no-sandbox", "--disable-blink-features=AutomationControlled",
+        args=["--no-sandbox",
+              "--disable-blink-features=AutomationControlled",
               "--disable-infobars"],
         ignore_default_args=["--enable-automation"],
         no_viewport=True,
@@ -89,53 +91,108 @@ def close_browser():
     _PAGE = _BROWSER = _PW = None
 
 
-# ── CAPTCHA helpers ───────────────────────────────────────────────────────────
+# ── CAPTCHA detection & waiting ───────────────────────────────────────────────
 
-def _is_captcha(page) -> bool:
-    """Returns True if Google is showing the CAPTCHA/sorry page."""
+def _has_real_results(page) -> bool:
+    """
+    Returns True if the page has real Google search results loaded.
+    This is the correct way to detect CAPTCHA is gone — not just URL check.
+    After solving CAPTCHA, Google may redirect to a URL that still briefly
+    contains /sorry/ in the redirect chain even though results are showing.
+    """
     try:
-        url = page.url or ""
-        return "/sorry/" in url or "google.com/sorry" in url
+        return page.evaluate(r"""
+            () => {
+                return !!(
+                    document.querySelector('#search') ||
+                    document.querySelector('#rso')    ||
+                    document.querySelector('.g')      ||
+                    document.querySelector('h3')      ||
+                    document.querySelector('[data-ved]')
+                );
+            }
+        """)
     except Exception:
         return False
 
 
-def _wait_captcha(page, timeout_min: int = 5) -> bool:
-    """
-    Print a message and wait up to timeout_min minutes for the user
-    to solve the CAPTCHA in the Chrome window.
-    Returns True when solved, False on timeout.
-    """
-    print(f"\n{'!'*60}")
-    print("  GOOGLE CAPTCHA — please solve it in the Chrome window")
-    print(f"  Waiting up to {timeout_min} minutes...")
-    print(f"{'!'*60}")
+def _is_captcha(page) -> bool:
+    """Returns True only if CAPTCHA is actively blocking results."""
+    try:
+        url = page.url or ""
+        # If on /sorry/ page AND no real results — it's a CAPTCHA
+        on_sorry = "/sorry/" in url or "google.com/sorry" in url
+        if not on_sorry:
+            return False
+        return not _has_real_results(page)
+    except Exception:
+        return False
 
-    for i in range(timeout_min * 12):   # poll every 5 seconds
-        time.sleep(5)
+
+def _bring_chrome_front():
+    """Try to bring Chrome window to front so user sees the CAPTCHA."""
+    try:
+        subprocess.Popen(
+            ['powershell', '-Command',
+             '$wshell = New-Object -ComObject wscript.shell; '
+             '$wshell.AppActivate("Google Chrome")'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        pass
+
+
+def _wait_captcha(page, timeout_min: int = 10) -> bool:
+    """
+    Wait for user to solve the CAPTCHA.
+    Checks every 10s whether real results have appeared (DOM check),
+    not just URL check — this was the bug causing it to miss the solve.
+    """
+    _bring_chrome_front()
+
+    print(f"\n{'='*65}")
+    print(f"  *** CAPTCHA — SOLVE IN CHROME WINDOW ***")
+    print(f"{'='*65}")
+    print(f"  1. Switch to the Chrome window")
+    print(f"  2. Tick 'I am not a robot'")
+    print(f"  3. Script auto-resumes once Google shows results")
+    print(f"  Timeout: {timeout_min} minutes")
+    print(f"{'='*65}\n")
+
+    for i in range(timeout_min * 6):   # every 10 seconds
+        time.sleep(10)
         try:
-            if not _is_captcha(page):
-                print("  Captcha solved — resuming.\n")
+            # Primary check: real search results in DOM
+            if _has_real_results(page):
+                print(f"  ✓ Results detected — CAPTCHA solved! Resuming...\n")
                 time.sleep(2)
                 return True
-        except Exception:
-            pass
-        if i > 0 and i % 12 == 0:
-            print(f"  Still waiting... ({timeout_min - i//12} min left)")
 
-    print("  Captcha timeout — skipping this search.\n")
+            # Secondary check: URL moved completely away from /sorry/
+            url = page.url or ""
+            if "/sorry/" not in url and "google.com/sorry" not in url:
+                print(f"  ✓ URL clear ({url[:50]}) — resuming...\n")
+                time.sleep(2)
+                return True
+
+        except Exception:
+            pass  # page may be navigating — keep waiting
+
+        elapsed = (i + 1) * 10
+        if elapsed % 30 == 0:
+            print(f"  Waiting {elapsed}s... (solve CAPTCHA in Chrome)")
+
+    print("  CAPTCHA timeout — skipping this seller.\n")
     return False
 
 
-# ── Main search function ──────────────────────────────────────────────────────
+# ── Google search ─────────────────────────────────────────────────────────────
 
 def _search_google(query: str) -> Dict:
     """
-    Open Google, search the query, extract phones/emails from:
-    - AI Overview (shown at top — has phone most of the time)
-    - Knowledge Panel (right sidebar)
-    - Search result snippets
-    Returns {phones, emails, urls, raw_text}
+    Navigate to Google, search the query, extract phones/emails from:
+    AI Overview, Knowledge Panel, snippets, full page text.
+    Handles CAPTCHA automatically.
     """
     result = {"phones": [], "emails": [], "urls": [], "raw_text": ""}
     try:
@@ -148,18 +205,19 @@ def _search_google(query: str) -> Dict:
         )
         time.sleep(2.5)
 
-        # Handle CAPTCHA — wait for user to solve it in Chrome window
+        # CAPTCHA check
         if _is_captcha(page):
-            solved = _wait_captcha(page, timeout_min=5)
+            solved = _wait_captcha(page, timeout_min=10)
             if not solved:
                 return result
-            # Re-navigate after solving
-            page.goto(
-                f"https://www.google.com/search?q={encoded}&hl=en&gl=in",
-                wait_until="domcontentloaded",
-                timeout=25_000,
-            )
-            time.sleep(2.5)
+            # If still on sorry page, re-navigate
+            if "/sorry/" in (page.url or ""):
+                page.goto(
+                    f"https://www.google.com/search?q={encoded}&hl=en&gl=in",
+                    wait_until="domcontentloaded",
+                    timeout=25_000,
+                )
+                time.sleep(2.5)
 
         # Accept cookies if prompted
         for btn_text in ["Accept all", "I agree"]:
@@ -173,22 +231,21 @@ def _search_google(query: str) -> Dict:
         full_text = page.evaluate("() => document.body.innerText") or ""
         result["raw_text"] = full_text
 
-        # Extract rich text from AI Overview + Knowledge Panel + snippets
+        # Extract from AI Overview + Knowledge Panel + snippets
         rich = page.evaluate(r"""
             () => {
                 var parts = [];
-                var selectors = [
+                [
                     '[data-attrid*="overview"]', '[class*="wDYxhc"]',
-                    '[class*="ILfuVd"]', '[class*="LGOjhe"]',
+                    '[class*="ILfuVd"]',  '[class*="LGOjhe"]',
                     '[class*="ai-overview"]', '[class*="SGlybb"]',
-                    '[jsname="yEVEwb"]', '.xpdopen',
+                    '[jsname="yEVEwb"]',  '.xpdopen',
                     '[data-attrid="wa:/description"]',
                     '.ifM9O', '.c2xzTb', '.V3FYCf',
                     '[data-attrid*="phone"]', '[data-attrid*="telephone"]',
                     '.VwiC3b', '.s3v9rd', '.IsZvec', '.aCOpRe',
                     '[data-sncf="1"]'
-                ];
-                selectors.forEach(function(sel) {
+                ].forEach(function(sel) {
                     document.querySelectorAll(sel).forEach(function(el) {
                         var t = el.innerText.trim();
                         if (t.length > 10) parts.push(t);
@@ -199,16 +256,12 @@ def _search_google(query: str) -> Dict:
         """) or ""
 
         combined = rich + "\n\n" + full_text
-        phones = extract_phones(combined)
-        emails = extract_emails(combined)
-        result["phones"] = list(dict.fromkeys(phones))
-        result["emails"] = list(dict.fromkeys(emails))
+        result["phones"] = list(dict.fromkeys(extract_phones(combined)))
+        result["emails"] = list(dict.fromkeys(extract_emails(combined)))
 
-        # Collect result URLs for fallback page visits
         urls = page.evaluate(r"""
             () => {
-                var seen = new Set();
-                var links = [];
+                var seen = new Set(), links = [];
                 document.querySelectorAll('a[href]').forEach(function(a) {
                     var h = a.href;
                     if (h && h.startsWith('http') &&
@@ -230,7 +283,7 @@ def _search_google(query: str) -> Dict:
 
 
 def _visit_page(url: str) -> Dict:
-    """Visit a URL with requests and scrape phone/email + Contact subpage."""
+    """Visit a URL with requests and scrape phone/email."""
     import requests as req
     from bs4 import BeautifulSoup
     from urllib.parse import urljoin
@@ -246,8 +299,8 @@ def _visit_page(url: str) -> Dict:
         r = req.get(url, headers=headers, timeout=12, allow_redirects=True)
         if r.status_code != 200:
             return out
-        soup  = BeautifulSoup(r.text, "lxml")
-        text  = soup.get_text(" ", strip=True)
+        soup   = BeautifulSoup(r.text, "lxml")
+        text   = soup.get_text(" ", strip=True)
         phones = extract_phones(text)
         emails = extract_emails(text)
 
@@ -278,15 +331,13 @@ def _visit_page(url: str) -> Dict:
     return out
 
 
+# ── Main entry point ──────────────────────────────────────────────────────────
+
 def search_seller_contact(company: str, city: str, state: str = "",
                           address: str = "", delay: float = 2.0) -> Dict:
-    """
-    Search Google for a seller's contact details — pure browser, no API.
-    Uses randomised delays (4–7s) to avoid CAPTCHA triggering.
-    """
+    """Search Google for a seller's contact. Query: 'Company City contact details'."""
     location = city.strip() or state.strip()
-
-    queries = []
+    queries  = []
     if location:
         queries.append(f"{company} {location} contact details")
     if state.strip() and state.strip() != location:
@@ -295,7 +346,6 @@ def search_seller_contact(company: str, city: str, state: str = "",
 
     for qi, query in enumerate(queries[:2]):
         if qi > 0:
-            # Longer delay between query retries
             time.sleep(4 + random.uniform(1, 3))
 
         sr = _search_google(query)
@@ -309,7 +359,6 @@ def search_seller_contact(company: str, city: str, state: str = "",
                 "notes":        f"AI Overview: {query[:70]}",
             }
 
-        # Visit top result pages as fallback
         for url in sr.get("urls", [])[:4]:
             time.sleep(1.5 + random.uniform(0, 1))
             pg = _visit_page(url)
