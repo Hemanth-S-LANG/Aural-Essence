@@ -36,7 +36,11 @@ _PW      = None
 # ── Browser management ────────────────────────────────────────────────────────
 
 def _get_page():
-    """Get a page — uses existing Chrome via CDP first, then launches fresh."""
+    """
+    Get a browser page for Google searching.
+    Uses a SEPARATE persistent Chrome profile (not the IndiaMART one with debug port).
+    Google blocks CDP-attached browsers — this launches a clean session.
+    """
     global _BROWSER, _PAGE, _PW
 
     try:
@@ -48,37 +52,20 @@ def _get_page():
 
     from playwright.sync_api import sync_playwright
 
-    # Try CDP — existing Chrome has real Google cookies
-    try:
-        pw_tmp = sync_playwright().start()
-        browser = pw_tmp.chromium.connect_over_cdp("http://localhost:9222")
-        ctx = browser.contexts[0] if browser.contexts else None
-        if ctx:
-            page = ctx.new_page()
-            page.set_default_timeout(25_000)
-            _PW = pw_tmp; _BROWSER = browser; _PAGE = page
-            return _PAGE
-        pw_tmp.stop()
-    except Exception:
-        try: pw_tmp.stop()
-        except Exception: pass
+    # Use a dedicated Google search profile — no debug port, no automation flags
+    GOOGLE_PROFILE = Path.home() / "GoogleSearch_Profile"
+    GOOGLE_PROFILE.mkdir(exist_ok=True)
 
-    # Fallback: launch with saved profile (visible, not headless)
     _PW = sync_playwright().start()
     _BROWSER = _PW.chromium.launch_persistent_context(
-        user_data_dir=str(PROFILE_DIR),
-        headless=False, channel="chrome",
-        args=["--no-sandbox",
-              "--disable-blink-features=AutomationControlled",
-              "--disable-infobars"],
-        ignore_default_args=["--enable-automation"],
+        user_data_dir=str(GOOGLE_PROFILE),
+        headless=False,
+        channel="chrome",
+        args=["--start-maximized"],
         no_viewport=True,
     )
     _PAGE = _BROWSER.pages[0] if _BROWSER.pages else _BROWSER.new_page()
     _PAGE.set_default_timeout(25_000)
-    _PAGE.add_init_script(
-        "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-    )
     return _PAGE
 
 
@@ -397,7 +384,7 @@ def search_seller_contact(company: str, city: str, state: str = "",
             }
 
         for url in sr.get("urls", [])[:4]:
-            time.sleep(1.5 + random.uniform(0, 1))
+            time.sleep(0.8 + random.uniform(0, 0.5))
             pg = _visit_page(url)
             if pg.get("phone"):
                 return {

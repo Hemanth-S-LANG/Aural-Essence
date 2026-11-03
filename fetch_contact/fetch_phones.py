@@ -122,15 +122,15 @@ def process_seller(seller: dict) -> dict:
     location = city or state
     print(f"    {company[:50]:<50} | {location}")
 
-    # ── Backoff when many consecutive misses (Google throttling) ─────────────
-    if _consec_miss >= 5:
-        wait = min(_consec_miss * 8, 90)   # 40s → 48s → 56s ... max 90s
-        print(f"  [backoff] {_consec_miss} consecutive misses — waiting {wait}s...")
+    # ── Backoff only after 10 consecutive misses ─────────────────────────────
+    if _consec_miss >= 10:
+        wait = min(_consec_miss * 5, 60)
+        print(f"  [backoff] {_consec_miss} misses — waiting {wait}s...")
         time.sleep(wait)
 
     # ── Google browser search ─────────────────────────────────────────────────
-    # 8–15 second delay between searches (slower = less throttling)
-    time.sleep(8 + random.uniform(0, 7))
+    # 8–12 second delay — works well, avoids Google throttling
+    time.sleep(8 + random.uniform(0, 4))
     result = search_seller_contact(company, city, state, address, delay=2.0)
 
     if result.get("phone"):
@@ -140,8 +140,7 @@ def process_seller(seller: dict) -> dict:
         return result
 
     # ── Google Maps fallback ──────────────────────────────────────────────────
-    time.sleep(DELAY)
-    maps = search_google_maps(company, location, delay=3.0)
+    maps = search_google_maps(company, location, delay=1.5)
     if maps.get("phone"):
         print(f"      ✓ MAPS: {maps['phone']} | {maps.get('notes','')[:55]}")
         _consec_miss = 0
